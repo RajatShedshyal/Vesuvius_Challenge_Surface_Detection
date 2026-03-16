@@ -1,0 +1,260 @@
+import numpy as np
+import cc3d
+from scipy import ndimage as ndi
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Core method B: Erosion → CC → Distance-Transform Voronoi
+# ──────────────────────────────────────────────────────────────────────────
+
+def erode_cc_voronoi(binary_mask, erosion_radius=2, min_component_size=50):
+    """
+    Break thin bridges via erosion, label surviving components, then
+    Voronoi-assign eroded voxels back to their nearest sheet.
+
+    Parameters
+    ----------
+    binary_mask : ndarray (bool / int)
+        3D volume, >0 = foreground.
+    erosion_radius : int
+        Binary-erosion iterations. Larger → more aggressive splitting.
+    min_component_size : int
+        Drop components smaller than this after erosion.
+
+    Returns
+    -------
+    labeled : ndarray int32   (0 = background, 1..N = sheet id)
+    n_sheets : int
+    """
+    mask = binary_mask > 0
+
+    # --- erode to break bridges -------------------------------------------
+    print(f"[1/3] Eroding mask (radius={erosion_radius})...")
+    eroded = ndi.binary_erosion(mask, iterations=erosion_radius)
+
+    if not eroded.any():
+        # erosion killed everything → try radius-1
+        if erosion_radius > 1:
+            print("      Erosion too aggressive, retrying with radius=1...")
+            return erode_cc_voronoi(mask, erosion_radius=1,
+                                    min_component_size=min_component_size)
+        print("      Mask vanished after erosion — returning single label.")
+        return mask.astype(np.int32), 1
+
+    # --- CC on eroded mask ------------------------------------------------
+    print("[2/3] Connected components on eroded mask...")
+    seed_labels, n_seeds = cc3d.connected_components(
+        eroded.astype(np.uint8), connectivity=26, return_N=True
+    )
+
+    # remove dust
+    if min_component_size > 0 and n_seeds > 1:
+        seed_labels = cc3d.dust(
+            seed_labels, threshold=min_component_size,
+            connectivity=26, in_place=True
+        )
+        # relabel contiguously
+        seed_labels, n_seeds = cc3d.connected_components(
+            (seed_labels > 0).astype(np.uint8), connectivity=26, return_N=True
+        )
+
+    print(f"      {n_seeds} sheet(s) after erosion + dust removal.")
+
+    if n_seeds <= 1:
+        # nothing to separate — return original mask as label 1
+        return mask.astype(np.int32), max(n_seeds, 1)
+
+    # --- Voronoi via distance transform -----------------------------------
+    print("[3/3] Voronoi assignment (distance_transform_edt)...")
+    seed_mask = seed_labels > 0
+
+    # distance_transform_edt(~seed_mask) computes, for every non-seed voxel,
+    # the distance to the nearest seed voxel and its coordinates.
+    _, nearest_idx = ndi.distance_transform_edt(
+        ~seed_mask, return_distances=True, return_indices=True
+    )
+
+    labeled = np.zeros(mask.shape, dtype=np.int32)
+    labeled[mask] = seed_labels[
+        nearest_idx[0][mask],
+        nearest_idx[1][mask],
+        nearest_idx[2][mask],
+    ]
+
+    n_final = int(labeled.max())
+    print(f"      Final: {n_final} sheet(s) after Voronoi.")
+    return labeled, n_final
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Core method A: Probability-valley detection
+# ──────────────────────────────────────────────────────────────────────────
+
+def probability_valley_separation(probs, binary_mask,
+                                  valley_threshold=0.5,
+                                  erosion_radius=1,
+                                  min_component_size=50):
+    """
+    Use the probability map to carve low-confidence valleys between sheets,
+    then CC-label the confident cores and Voronoi the rest.
+
+    Parameters
+    ----------
+    probs : ndarray float32       Probability map from model.
+    binary_mask : ndarray          Thresholded binary predictions.
+    valley_threshold : float       Prob below this → valley / gap.
+    erosion_radius : int           Extra erosion on cores.
+    min_component_size : int       Drop small components.
+
+    Returns
+    -------
+    labeled : ndarray int32
+    n_sheets : int
+    """
+    mask = binary_mask > 0
+
+    print(f"[1/3] Carving valleys (prob < {valley_threshold})...")
+    confident = mask & (probs >= valley_threshold)
+
+    if erosion_radius > 0:
+        confident = ndi.binary_erosion(confident, iterations=erosion_radius)
+
+    if not confident.any():
+        print("      No confident voxels survived — returning single label.")
+        return mask.astype(np.int32), 1
+
+    print("[2/3] CC on confident cores...")
+    seed_labels, n_seeds = cc3d.connected_components(
+        confident.astype(np.uint8), connectivity=26, return_N=True
+    )
+
+    if min_component_size > 0 and n_seeds > 1:
+        seed_labels = cc3d.dust(
+            seed_labels, threshold=min_component_size,
+            connectivity=26, in_place=True
+        )
+        seed_labels, n_seeds = cc3d.connected_components(
+            (seed_labels > 0).astype(np.uint8), connectivity=26, return_N=True
+        )
+
+    print(f"      {n_seeds} sheet(s) in confident regions.")
+
+    if n_seeds <= 1:
+        return mask.astype(np.int32), max(n_seeds, 1)
+
+    print("[3/3] Voronoi assignment (distance_transform_edt)...")
+    seed_mask = seed_labels > 0
+    _, nearest_idx = ndi.distance_transform_edt(
+        ~seed_mask, return_distances=True, return_indices=True
+    )
+
+    labeled = np.zeros(mask.shape, dtype=np.int32)
+    labeled[mask] = seed_labels[
+        nearest_idx[0][mask],
+        nearest_idx[1][mask],
+        nearest_idx[2][mask],
+    ]
+
+    n_final = int(labeled.max())
+    print(f"      Final: {n_final} sheet(s) after Voronoi.")
+    return labeled, n_final
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Boundary enforcement (vectorized)
+# ──────────────────────────────────────────────────────────────────────────
+
+def enforce_separation(labeled_vol, boundary_width=1):
+    """
+    Zero out voxels at interfaces between different sheet labels.
+
+    Uses max_filter ≠ min_filter (O(N), fully vectorized) instead of
+    Python triple loops.
+
+    Parameters
+    ----------
+    labeled_vol : ndarray int32
+    boundary_width : int   (half-width of the structuring element)
+
+    Returns
+    -------
+    cleaned : ndarray int32
+    """
+    print("[Sep] Enforcing separation boundaries (vectorized)...")
+    size = 2 * boundary_width + 1
+    fg = labeled_vol > 0
+
+    local_max = ndi.maximum_filter(labeled_vol, size=size)
+
+    # For the minimum we must ignore background (0) — replace with large sentinel
+    lab_for_min = labeled_vol.copy()
+    lab_for_min[~fg] = int(labeled_vol.max()) + 1
+    local_min_fg = ndi.minimum_filter(lab_for_min, size=size)
+
+    boundary = fg & (local_max != local_min_fg)
+
+    cleaned = labeled_vol.copy()
+    cleaned[boundary] = 0
+
+    n_removed = int(boundary.sum())
+    print(f"      Removed {n_removed} boundary voxels.")
+    return cleaned
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Main entry point
+# ──────────────────────────────────────────────────────────────────────────
+
+def dissolve_sheet_merges(volume_binary, probs=None, method="erosion",
+                          erosion_radius=2, valley_threshold=0.5,
+                          min_component_size=50,
+                          enforce_boundaries=True, boundary_width=1):
+    """
+    Separate merged sheets in a binary prediction volume.
+
+    Parameters
+    ----------
+    volume_binary : ndarray        Binary prediction (>0 = surface).
+    probs : ndarray or None        Model probability map (enables method='probability').
+    method : str                   'erosion' | 'probability'
+    erosion_radius : int           Erosion strength for bridge-breaking.
+    valley_threshold : float       Prob cutoff for valley detection.
+    min_component_size : int       Drop components smaller than this.
+    enforce_boundaries : bool      Insert 1-voxel gaps between sheets.
+    boundary_width : int           Gap half-width.
+
+    Returns
+    -------
+    labeled : ndarray int32   (0 = bg, 1..N = sheet id)
+    n_sheets : int
+    """
+    mask = volume_binary > 0
+    n_fg = int(mask.sum())
+    print(f"Sheet separation: {n_fg:,} foreground voxels, method='{method}'")
+
+    if n_fg == 0:
+        print("No foreground voxels.")
+        return volume_binary.astype(np.int32), 0
+
+    # --- choose method ----------------------------------------------------
+    if method == "probability" and probs is not None:
+        labeled, n_sheets = probability_valley_separation(
+            probs, mask,
+            valley_threshold=valley_threshold,
+            erosion_radius=erosion_radius,
+            min_component_size=min_component_size,
+        )
+    else:
+        if method == "probability" and probs is None:
+            print("Warning: probs not provided, falling back to 'erosion'.")
+        labeled, n_sheets = erode_cc_voronoi(
+            mask,
+            erosion_radius=erosion_radius,
+            min_component_size=min_component_size,
+        )
+
+    # --- boundary enforcement ---------------------------------------------
+    if enforce_boundaries and n_sheets > 1:
+        labeled = enforce_separation(labeled, boundary_width=boundary_width)
+
+    return labeled, n_sheets

@@ -1,0 +1,357 @@
+import scipy.ndimage as ndi
+import numpy as np
+import cv2
+
+import cc3d
+#import FastGeodis
+import dijkstra3d
+
+#----------------------------------------------------------
+def image_show(name, image, type=None, resize=1):
+    if type == 'rgb2bgr':
+        image = np.ascontiguousarray(image[:, :, ::-1])
+
+    H, W = image.shape[0:2]
+    cv2.namedWindow(name, cv2.WINDOW_GUI_NORMAL)  # WINDOW_NORMAL
+    # cv2.namedWindow(name, cv2.WINDOW_GUI_EXPANDED)  #WINDOW_GUI_EXPANDED
+    cv2.imshow(name, image)
+    cv2.resizeWindow(name, round(resize * W), round(resize * H))
+
+def image_norm_show(name, image, type=None, resize=1):
+    image = image.astype(np.float32)
+    if type == 'rgb2bgr':
+        image = np.ascontiguousarray(image[:, :, ::-1])
+
+    H, W = image.shape[0:2]
+    image = (image-image.min()) / (image.max() - image.min()+1e-8)
+    cv2.namedWindow(name, cv2.WINDOW_GUI_NORMAL)  # WINDOW_NORMAL
+    # cv2.namedWindow(name, cv2.WINDOW_GUI_EXPANDED)  #WINDOW_GUI_EXPANDED
+    cv2.imshow(name, image)
+    cv2.resizeWindow(name, round(resize * W), round(resize * H))
+
+
+
+#----------------------------------------------------------
+from matplotlib.colors import ListedColormap
+try:
+    import pyvista as pv
+
+    def show_in_3d(data, cmap="tab20", title=None):
+        vol = data.astype(np.uint8)
+        #vol = data.astype(np.float32)
+        #print(vol.min(),vol.max())
+
+        grid = pv.wrap(vol)
+
+        # ----------------------------------------------------------
+        if cmap=='my_color':
+            my_color = np.full((256,4),fill_value=64,dtype=np.uint8)
+            my_color[0]   = [  0,   0,   0, 255]
+            my_color[1]   = [255, 255,   0, 255]
+            my_color[2]   = [255,   0, 255, 255]
+            my_color[3]   = [  0, 255, 255, 255]
+            my_color[4]   = [  0,   0, 255, 255]
+            my_color[5]   = [  0, 255,   0, 255]
+            #---repeat ---
+            for i in range(6,200):
+                my_color[i] = my_color[(i-6)%5+1]
+
+
+            my_color[254] = [  0,   0, 255, 255]
+            my_color[255] = [255,   0,   0, 255]
+            cmap = ListedColormap(my_color/255)
+        # Normalized (optional, if you want float colors)
+
+        opacity = np.ones(256)*0.8
+        opacity[  0] = 0.0  #bg?
+        opacity[200] = 0.01  #special purpose (marker)
+        opacity[254] = 1.0  #special purpose (marker)
+        opacity[255] = 1.0  #special purpose (marker)
+        opacity = opacity*255
+
+        labels = data.astype(np.int32)
+        grid["labels"] = labels.flatten(order="F")  # PyVista expects Fortran order
+        #assert labels.max() < 256
+        #----
+
+        plotter = pv.Plotter(title=title)
+        plotter.add_volume(
+            grid,
+            scalars="labels",
+            shade=True,
+            cmap=cmap,
+            #opacity=opacity,
+            opacity=opacity,
+
+            categories=256,
+            n_colors=256,      # ✅ guarantees TF/LUT length match
+            clim=(0, 255),     # ✅ prevents squeezing to [min,max]
+        )
+        plotter.show_axes()
+        plotter.show()
+
+except:
+    print('import pyvista failed !!!!!!!')
+    print('show_in_3d() default to null')
+    def show_in_3d(data, cmap="tab20", title=None):
+        return
+
+########################################3
+##PARAMETERS
+RAYCAST_IOU=0.1
+SPLIT_RANGE=20
+MIN_POINT_LENGTH=8
+SPLIT_2_MAX_TRIAL=100
+SPLIT_2_REMOVE_THR=0.9
+SPLIT_ALL_MAX_DEPTH=50
+
+########################################3
+def add_z(point_yx,z):
+    return np.concatenate([
+        np.full((len(point_yx),1),fill_value=z,dtype=point_yx.dtype),
+        point_yx,
+    ],-1)
+
+
+## ray casting ------------
+def compute_iou_1d(
+    x1, x2
+):
+    x1 = x1!=0
+    x2 = x2!=0
+    inter = (x1 & x2).sum()
+    union = (x1 | x2).sum()
+    return inter / (union + 1e-6)
+
+# ray casting test
+def do_ray_casting(
+    point1,  #yx format: Nx2
+    point2,
+    h,w
+):
+    # for y
+    by1 = np.bincount(point1[:, 0], minlength=h)
+    by2 = np.bincount(point2[:, 0], minlength=h)
+    #iouy = compute_iou_2d(by1, by2)
+    #print('iouy', iouy)
+
+    # for x
+    bx1 = np.bincount(point1[:, 1], minlength=w)
+    bx2 = np.bincount(point2[:, 1], minlength=w)
+    #ioux = compute_iou_2d(bx1, bx2)
+    #print('iou', ioux)
+
+    #we do joint test
+    iou = compute_iou_1d(
+        np.concatenate([by1, bx1]),
+        np.concatenate([by2, bx2]),
+    )
+    return iou
+
+# test single or multiple surfaces -----
+def split_range(d, min_size=64):
+    """
+    Split range [0, d) into the fewest approximately equal parts,
+    each of size >= min_size.
+
+    Returns list of (start, end) intervals.
+    """
+    k = max(1, d // min_size)  # number of parts
+    edges = np.linspace(0, d, k + 1, dtype=int)
+
+    # ensure coverage and monotonicity
+    edges[-1] = d
+
+    return [(edges[i], edges[i+1]) for i in range(k)]
+'''
+for d in range(1,160,32):
+    print('d', d,  split_range(d, min_size=32))
+exit(0)
+
+'''
+
+
+def find_different_surface_seed(
+    problem,
+    iou_threshold=0.1,
+):
+    d,h,w = problem.shape
+    split = split_range(d, min_size=SPLIT_RANGE)
+
+    is_multi_surface = False
+    found=None
+    for z1,z2 in split:
+        if is_multi_surface:
+            break
+
+        z = (z1+z2)//2 #np.random.randint(z1,z2) # (z1+z2)//2
+        ccz = cc3d.connected_components(problem[z])
+
+        point = [None]  # bg placeholder
+        for i in range(1, ccz.max() + 1):
+            p = np.stack(np.where(ccz == i)).T
+            if len(p) >=MIN_POINT_LENGTH:
+                point.append(p)
+
+        if len(point)<=1:
+            continue
+
+        #to ray casting test
+        num = len(point)
+        print('found num', num)
+        for i1 in range(1, num):
+            if is_multi_surface:
+                break
+
+            for i2 in range(i1+1, num):
+                iou = do_ray_casting(point[i1], point[i2], h, w)
+                print('\traycast iou:', i1,i2, iou)
+                if iou>= iou_threshold:
+                    is_multi_surface = True
+                    found = {
+                        'z' : (z1,z2, z),
+                        'point1_yx' : point[i1],
+                        'point2_yx' : point[i2],
+                    }
+                    break
+
+    return is_multi_surface, found
+
+
+
+# iteratively  split-----
+
+def split_problem_to_two(
+    problem,
+    point1_zyx,
+    point2_zyx,
+    is_dilate=True
+):
+    DEBUG=False
+    sucess  = False
+    problem = problem.copy()
+
+    for trial in range(SPLIT_2_MAX_TRIAL):
+        path =[]
+
+        k1 = np.arange(len(point1_zyx))
+        np.random.shuffle(k1)
+        startpoint = point1_zyx[k1[:8]]
+        for (sz, sy, sx) in startpoint:
+            parent = dijkstra3d.parental_field(
+                np.where(problem, 1.0, 1e6).astype(np.float32), source=(sz, sy, sx), connectivity=26)
+
+            k2 = np.arange(len(point2_zyx))
+            np.random.shuffle(k2)
+            endppoint =  point2_zyx[k2[:8]]
+            path.extend([
+                dijkstra3d.path_from_parents(parent, (ez, ey, ex))
+                         for (ez, ey, ex) in endppoint
+            ])
+        path_flat = np.concatenate(path)
+        jump = np.any(~problem[path_flat[:,0],path_flat[:,1],path_flat[:,2]]) #brige in "air"/bg
+
+        if jump:
+            sucess = True
+            separated =  cc3d.connected_components(problem)
+            if DEBUG: #for debug
+                show_in_3d(separated, cmap='my_color',title='separated')
+
+
+            return sucess, separated
+            #break
+        else:
+            #remove common path and tr
+           # how to get cooment point in path_flat ????
+
+
+            uniq, cnt = np.unique(path_flat, axis=0, return_counts=True)
+            order = np.argsort(-cnt)  # descending by count
+            uniq = uniq[order]
+            cnt = cnt[order]
+            print('cnt',trial,  cnt[:5])
+
+            #for debug
+            if (trial==0) & DEBUG:
+                overlay3d = problem.astype(np.uint8)
+                overlay3d[uniq[:,0],uniq[:,1],uniq[:,2]]= 255#cnt+1
+                show_in_3d(overlay3d, cmap='my_color',title='overlay3d')
+
+            #remove
+            threshold =SPLIT_2_REMOVE_THR*(cnt.max())
+            u = uniq[cnt>=threshold]
+            if not is_dilate:
+                problem[u[:, 0], u[:, 1], u[:, 2]] = False  # you can dilate for speedup
+            else:
+                larger = np.zeros_like(problem, dtype=bool)
+                larger[u[:, 0], u[:, 1], u[:, 2]]=True
+                larger = ndi.morphology.binary_dilation(
+                    larger, structure=np.ones((3, 3, 3), dtype=bool), iterations=1)
+                problem[larger]=False
+
+    return sucess, problem
+
+
+def split_all_surface(problem, result, depth=0, max_depth=SPLIT_ALL_MAX_DEPTH):
+    def collecting_and_return():
+        #show_in_3d(problem, cmap='my_color', title='solved problem')
+        result.append(problem)
+        return
+    #------------------------------
+
+    print('spliting at depth', depth)
+    if depth >= max_depth:
+        return collecting_and_return()
+
+    is_multi_surface, found = find_different_surface_seed(
+        problem,
+        iou_threshold=RAYCAST_IOU,
+    )
+    if not is_multi_surface:
+        return  collecting_and_return()
+
+    print('is_multi_surface', is_multi_surface)
+    print('found:')
+    print('\tz:', found['z'])
+    print('\tpoint1_yx:', len(found['point1_yx']))
+    print('\tpoint2_yx:', len(found['point2_yx']))
+
+    point1_zyx = add_z(found['point1_yx'], found['z'][2])
+    point2_zyx = add_z(found['point2_yx'], found['z'][2])
+    s, solved = split_problem_to_two(
+        problem,
+        point1_zyx,
+        point2_zyx,
+        is_dilate=True
+    )
+    if not s:
+        return  collecting_and_return()
+
+    split_all_surface(solved==1, result, depth + 1, max_depth)
+    split_all_surface(solved==2, result, depth + 1, max_depth)
+
+
+
+if __name__ == '__main__':
+    problem = None
+    show_in_3d(problem, cmap='my_color', title='problem')
+
+    is_multi_surface, found = find_different_surface_seed(
+        problem,
+        iou_threshold=0.1,
+    )
+    print('is_multi_surface', is_multi_surface)
+    if is_multi_surface:
+        print('found:')
+        print('\tz:', found['z'])
+        print('\tpoint1_yx:', len(found['point1_yx']))
+        print('\tpoint2_yx:', len(found['point2_yx']))
+
+    point1_zyx = add_z(found['point1_yx'], found['z'][2])
+    point2_zyx = add_z(found['point2_yx'], found['z'][2])
+    s, solved = split_problem_to_two(
+        problem,
+        point1_zyx,
+        point2_zyx,
+    )
+    print('solved', solved.max())

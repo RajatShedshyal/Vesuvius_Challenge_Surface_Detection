@@ -1,0 +1,352 @@
+import numpy as np
+import math
+import cc3d
+from scipy.ndimage import gaussian_filter
+# def get_dominant_stacking_normal(volume, sigma=1.5):
+#     print("[1/4] Estimating 3D stacking axis...")
+#     vol = gaussian_filter(volume.astype(np.float32), sigma=sigma)
+#     gz, gx, gy = np.gradient(vol)
+    
+#     grad_mag = np.sqrt(gz**2 + gx**2 + gy**2)
+#     mask = grad_mag > np.percentile(grad_mag, 85)
+    
+#     if not np.any(mask): 
+#         return np.array([1.0, 0.0, 0.0])
+
+#     grads = np.stack([gz[mask], gx[mask], gy[mask]], axis=1)
+#     C = grads.T @ grads
+#     vals, vecs = np.linalg.eigh(C)
+    
+#     # Eigenvector with largest eigenvalue is the stacking normal
+#     normal = vecs[:, np.argmax(vals)]
+#     if normal[0] < 0: normal = -normal 
+#     return normal / np.linalg.norm(normal)
+
+def get_dominant_stacking_normal(volume):
+    print("[1/4] Estimating stacking axis via coordinate PCA...")
+
+    coords = np.argwhere(volume > 0)
+    if len(coords) < 100:
+        return np.array([1.0, 0.0, 0.0])
+
+    # Center coordinates
+    coords = coords - coords.mean(axis=0)
+
+    # Covariance of spatial positions
+    C = coords.T @ coords
+
+    vals, vecs = np.linalg.eigh(C)
+
+    # Smallest variance direction = stacking axis
+    normal = vecs[:, np.argmin(vals)]
+
+    if normal[0] < 0:
+        normal = -normal
+
+    return normal / np.linalg.norm(normal)
+
+def generate_normal_aligned_seeds(volume, normal, num_rays=2, d_dist=50):
+    """
+    num_rays: Number of rays to shoot (distributed along the plane)
+    d_dist: The total span/width across which rays are distributed
+    """
+    print(f"[2/4] Planting seeds using {num_rays} rays across {d_dist}px span...")
+    D, H, W = volume.shape
+    seed_list = []
+
+    coords = np.argwhere(volume > 0)
+    if len(coords) == 0: return []
+    
+    projections = coords @ normal
+    p_min, p_max = projections.min(), projections.max()
+    center_mass = coords.mean(axis=0)
+    
+    # Origin point shifted back
+    start_origin = center_mass + normal * (p_min - (coords @ normal).mean() - 50)
+
+    # Setup Basis
+    idx = np.argmin(np.abs(normal))
+    v_dummy = np.zeros(3); v_dummy[idx] = 1
+    u = np.cross(normal, v_dummy); u /= np.linalg.norm(u)
+    v = np.cross(normal, u); v /= np.linalg.norm(v)
+
+    # Generate ray offsets
+    if num_rays > 1:
+        offsets = np.linspace(-d_dist / 2, d_dist / 2, num_rays)
+    else:
+        offsets = [0] # Single center ray
+    
+    for off_u in offsets:
+        ray_start = start_origin + (off_u * u)
+        in_surface = False
+        sheet_id = 0 
+        
+        # Trace ray
+        max_dist = (p_max - p_min) + 40
+        for t in np.arange(0, max_dist, 0.25):
+            pos = (ray_start + t * normal).astype(int)
+            
+            if 0 <= pos[0] < D and 0 <= pos[1] < H and 0 <= pos[2] < W:
+                is_solid = volume[pos[0], pos[1], pos[2]] > 0
+                
+                if not in_surface and is_solid:
+                    in_surface = True
+                    sheet_id += 1 
+                    seed_list.append((pos[0], pos[1], pos[2], sheet_id))
+                elif in_surface and not is_solid:
+                    in_surface = False
+                    seed_list.append((pos[0], pos[1], pos[2], sheet_id))
+
+    print(f"      Planted {len(seed_list)} total seeds.")
+    return seed_list
+
+# Chamfer and Pipeline remain logic-identical, ensure they are imported.
+
+
+# --------------------------------------------------------------------------
+# 3. CHAMFER GEODESIC VORONOI
+# --------------------------------------------------------------------------
+def chamfer_geodesic_voronoi_3d(mask, seed_data):
+    print("[3/4] Running Geodesic Voronoi...")
+    D, H, W = mask.shape
+    dist = np.full((D, H, W), 1e9, dtype=np.float32)
+    lab  = np.zeros((D, H, W), dtype=np.int32)
+
+    for z, x, y, label in seed_data:
+        if mask[z, x, y]:
+            dist[z, x, y] = 0.0
+            lab[z, x, y] = label
+
+    nbrs = []
+    for dz in [-1, 0, 1]:
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dz == dx == dy == 0: continue
+                w = math.sqrt(dz*dz + dx*dx + dy*dy)
+                nbrs.append((dz, dx, dy, np.float32(w)))
+
+    fwd = [n for n in nbrs if (n[0]<0) or (n[0]==0 and n[1]<0) or (n[0]==0 and n[1]==0 and n[2]<0)]
+    bwd = [n for n in nbrs if (n[0]>0) or (n[0]==0 and n[1]>0) or (n[0]==0 and n[1]==0 and n[2]>0)]
+
+    def pass_logic(z_range, x_range, y_range, neighbors):
+        for z in z_range:
+            for x in x_range:
+                for y in y_range:
+                    if not mask[z, x, y]: continue
+                    d_min, l_min = dist[z, x, y], lab[z, x, y]
+                    for dz, dx, dy, w in neighbors:
+                        zz, xx, yy = z+dz, x+dx, y+dy
+                        if 0 <= zz < D and 0 <= xx < H and 0 <= yy < W:
+                            new_d = dist[zz, xx, yy] + w
+                            if new_d < d_min:
+                                d_min, l_min = new_d, lab[zz, xx, yy]
+                    dist[z, x, y], lab[z, x, y] = d_min, l_min
+
+    pass_logic(range(D), range(H), range(W), fwd)
+    pass_logic(range(D-1, -1, -1), range(H-1, -1, -1), range(W-1, -1, -1), bwd)
+    return lab
+
+# --------------------------------------------------------------------------
+# 4. FULL PIPELINE
+# --------------------------------------------------------------------------
+def enforce_separation(labeled_vol):
+
+  print("[4/4] Enforcing separation boundaries...")
+
+  D, H, W = labeled_vol.shape
+  cleaned = labeled_vol.copy()
+
+  for z in range(1, D-1):
+    for x in range(1, H-1):
+      for y in range(1, W-1):
+
+        current = labeled_vol[z, x, y]
+        if current == 0:
+          continue
+
+        neighborhood = labeled_vol[z-1:z+2,
+                                   x-1:x+2,
+                                   y-1:y+2]
+
+        unique = np.unique(neighborhood)
+        unique = unique[unique != 0]
+
+        if len(unique) > 1:
+          cleaned[z, x, y] = 0
+
+  return cleaned
+
+def dissolve_sheet_merges(volume_binary):
+    normal = get_dominant_stacking_normal(volume_binary)
+    seeds = generate_normal_aligned_seeds(volume_binary, normal)
+    
+    if not seeds:
+        print("No seeds found.")
+        return volume_binary.astype(np.int32), [], normal
+
+    labeled_vol = chamfer_geodesic_voronoi_3d(volume_binary > 0, seeds)
+    
+    print("[4/4] Extracting final connected components...")
+    final_labels = cc3d.connected_components(labeled_vol, connectivity=26)
+    n_components = final_labels.max()
+    print(f"Success: Separated volume into {n_components} distinct components.")
+    output =enforce_separation(final_labels)
+    
+    return output, seeds, normal
+import numpy as np
+import cc3d
+from postproc import dissolve_sheet_merges
+
+def postprocessing_v3(binary_volume, min_size=500, padding=5):
+    """
+    Iterates through all connected components, applies dissolve_sheet_merges 
+    to split merged scrolls, and returns a clean 0/1 volume.
+    """
+    # 1. Identify initial components
+    labels = cc3d.connected_components(binary_volume, connectivity=26)
+    stats = cc3d.statistics(labels)
+    n_comp = labels.max()
+    
+    # Initialize an empty volume for the results
+    refined_output = np.zeros_like(binary_volume, dtype=np.uint8)
+    
+    print(f"Post-processing: Found {n_comp} initial components.")
+
+    for comp_id in range(1, n_comp + 1):
+        voxel_count = stats['voxel_counts'][comp_id]
+        
+        # Skip components that are too small (dust)
+        if voxel_count < min_size:
+            continue
+            
+        # 2. Extract Bounding Box for Local Processing (Memory Efficiency)
+        bbox = stats['bounding_boxes'][comp_id]
+        # Create slices with padding to ensure we don't clip the edges
+        slices = tuple(slice(max(0, s.start - padding), min(m, s.stop + padding)) 
+                       for s, m in zip(bbox, labels.shape))
+        
+        # Isolate the specific component in a local crop
+        local_mask = (labels[slices] == comp_id)
+        
+        try:
+            # 3. Apply the split logic
+            # dissolve_sheet_merges usually returns (split_labels, seeds, normal)
+            split_labels, _, _ = dissolve_sheet_merges(local_mask)
+            
+            # 4. Re-insert the processed component back into the global volume
+            # We convert split_labels back to a binary mask (anything > 0 is a sheet)
+            refined_local_binary = (split_labels > 0).astype(np.uint8)
+            
+            # Use 'logical_or' or direct assignment to place back into the volume
+            refined_output[slices] = np.maximum(refined_output[slices], refined_local_binary)
+            
+        except Exception as e:
+            print(f"Error processing component {comp_id}: {e}")
+            # If splitting fails, keep the original mask for this component
+            refined_output[slices] = np.maximum(refined_output[slices], local_mask.astype(np.uint8))
+
+    return refined_output
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+
+def test_projection_distribution(local_mask, normal):
+    print("\n[Diagnostic] Testing projection depth distribution...")
+
+    coords = np.argwhere(local_mask > 0)
+    if len(coords) == 0:
+        print("No voxels in component.")
+        return
+
+    # Compute projection depths
+    depths = coords @ normal
+
+    print(f"Total voxels: {len(depths)}")
+    print(f"Depth range: {depths.min():.3f} → {depths.max():.3f}")
+    print(f"Depth std: {depths.std():.3f}")
+
+    # Plot histogram
+    plt.figure(figsize=(8,4))
+    plt.hist(depths, bins=100)
+    plt.title("Projection Depth Histogram")
+    plt.xlabel("Depth (projection onto normal)")
+    plt.ylabel("Voxel count")
+    plt.show()
+
+    # Quick 2-cluster KMeans test
+    depths_reshaped = depths.reshape(-1, 1)
+    kmeans = KMeans(n_clusters=2, n_init=10, random_state=0)
+    labels = kmeans.fit_predict(depths_reshaped)
+
+    centers = sorted(kmeans.cluster_centers_.flatten())
+    print(f"KMeans 2-cluster centers: {centers}")
+
+    separation = abs(centers[1] - centers[0])
+    print(f"Center separation distance: {separation:.3f}")
+import numpy as np
+from scipy import ndimage
+import cc3d
+
+def get_oriented_disk_struct(normal, radius=3):
+    """
+    Creates a 3D structuring element that is a flat disk 
+    perpendicular to the 'normal' vector.
+    """
+    size = radius * 2 + 1
+    # Create a local coordinate grid
+    zz, yy, xx = np.meshgrid(
+        np.arange(-radius, radius + 1),
+        np.arange(-radius, radius + 1),
+        np.arange(-radius, radius + 1),
+        indexing='ij'
+    )
+    
+    # Calculate distance from the plane defined by the normal
+    # Equation: ax + by + cz = 0
+    dist_from_plane = np.abs(zz * normal[0] + yy * normal[1] + xx * normal[2])
+    dist_from_center = np.sqrt(zz**2 + yy**2 + xx**2)
+    
+    # We want points that are:
+    # 1. Very close to the plane (thickness ~ 1px)
+    # 2. Within the radius from the center
+    struct = (dist_from_plane <= 0.8) & (dist_from_center <= radius)
+    return struct.astype(bool)
+
+def seal_and_repair_planar(volume, min_size=500, radius=4):
+    """
+    Repairs volume by closing holes with a disk aligned to the sheet normal.
+    """
+    binary_vol = (volume > 0).astype(np.uint8)
+    labels = cc3d.connected_components(binary_vol, connectivity=26)
+    stats = cc3d.statistics(labels)
+    clean_vol = np.zeros_like(binary_vol, dtype=np.uint8)
+    
+    for i in range(1, labels.max() + 1):
+        if stats['voxel_counts'][i] < min_size:
+            continue
+            
+        bbox = stats['bounding_boxes'][i]
+        p = radius + 2 
+        slices = tuple(slice(max(0, s.start - p), min(m, s.stop + p)) 
+                       for s, m in zip(bbox, volume.shape))
+        
+        comp_mask = (labels[slices] == i)
+        
+        # 1. Get the local normal for THIS specific component
+        comp_normal = get_dominant_stacking_normal(comp_mask)
+        
+        # 2. Create a 'Plate' structuring element perpendicular to the normal
+        # This bridges gaps ONLY within the sheet plane
+        struct = get_oriented_disk_struct(comp_normal, radius=radius)
+        
+        # 3. Apply the Planar Closing
+        # This stitches the papyrus 'lace' into a solid sheet
+        sealed_mask = ndimage.binary_closing(comp_mask, structure=struct)
+        
+        # 4. Fill Voids (Dim 1 fix)
+        filled_mask = ndimage.binary_fill_holes(sealed_mask)
+        
+        clean_vol[slices] = np.maximum(clean_vol[slices], filled_mask.astype(np.uint8))
+        
+    return clean_vol
