@@ -2,6 +2,8 @@
 
 A complete solution for the Kaggle Vesuvius Challenge - detecting and reconstructing the surface of an ancient Roman scroll from 3D X-ray CT scans. This repository implements two primary segmentation approaches (**SwinUNETR Baseline** and **nnUNet**) combined with advanced post-processing techniques for hole filling, sheet repair, and topological refinement.
 
+**Link:** [Kaggle_Vesuvius_Surface_Detectio](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard)
+
 ## Core Solutions
 
 ### Segmentation Models
@@ -334,7 +336,7 @@ This is a complete submission to the **Kaggle Vesuvius Challenge** - a competiti
 
 **Challenge Goal**: Automatically detect and reconstruct the ink-covered surface of a scroll from volumetric CT data, making the written text readable.
 
-**Link**: [Kaggle Vesuvius Challenge](https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection)
+**Link**: [Kaggle Vesuvius Challenge](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard)
 
 ## Contributing
 
